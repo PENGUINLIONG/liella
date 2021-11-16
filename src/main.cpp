@@ -1,13 +1,15 @@
 // # Liella Program Entrance
 // @PENGUINLIONG
+#include <cassert>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
-
+#include "liella/spv-instr.hpp"
 
 std::vector<uint32_t> load_spv(const std::string& path) {
   std::ifstream is(path, std::ios::in | std::ios::ate | std::ios::binary);
+  assert(is);
   size_t size = is.tellg();
   is.seekg(0, std::ios::beg);
   std::vector<uint32_t> spv;
@@ -23,16 +25,21 @@ void store_spv(const std::string& path, const std::vector<uint32_t> spv) {
 }
 
 int main(int argc, const char** argv) {
-  if (argc < 1) {
+  using namespace liella;
+
+  if (argc <= 1) {
     std::cout << "input path not specified" << std::endl;
     return -1;
   }
-  if (argc < 2) {
+  if (argc <= 2) {
     std::cout << "output path not specified" << std::endl;
     return -1;
   }
 
   std::vector<uint32_t> spv = load_spv(argv[1]);
+
+  spv = serialize_spv(deserialize_spv(spv));
+
   std::cout << spv.size() << " words" << std::endl;
   store_spv(argv[2], spv);
 
