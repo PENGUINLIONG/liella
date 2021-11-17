@@ -1,7 +1,10 @@
 // # SPIR-V Instruction Utilities
 // @PENGUINLIONG
+#pragma once
 #include <cstdint>
 #include <vector>
+#include <memory>
+#define SPV_ENABLE_UTILITY_CODE
 #include "spirv/unified1/SPIRV.hpp"
 
 namespace liella {
@@ -11,13 +14,17 @@ enum OperandType {
   OPERAND_TYPE_WEAK_REF,
   OPERAND_TYPE_STRONG_REF,
 };
-struct Operand {
-  OperandType operand_ty;
-  uint32_t value;
+struct OperandIterator {
+  const uint32_t* inner;
+
+  uint32_t u32() { return *(inner++); }
+  spv::Id id() { return (spv::Id)*(inner++); }
 };
 struct Instruction {
-  uint32_t opcode;
-  std::vector<Operand> operands;
+  spv::Op opcode;
+  std::vector<uint32_t> operands;
+
+  OperandIterator iter() const { return OperandIterator { operands.data() }; }
 };
 
 struct SpirvBinary {
@@ -26,7 +33,7 @@ struct SpirvBinary {
   uint32_t generator_magic;
   uint32_t bound;
   uint32_t reserved;
-  std::vector<Instruction> instrs;
+  std::vector<std::shared_ptr<Instruction>> instrs;
 };
 
 SpirvBinary deserialize_spv(const std::vector<uint32_t>& spv) {
@@ -47,15 +54,12 @@ SpirvBinary deserialize_spv(const std::vector<uint32_t>& spv) {
     auto next_beg = beg + instr_size;
 
     Instruction instr {};
-    instr.opcode = opcode;
+    instr.opcode = (spv::Op)opcode;
     for (auto pos = beg + 1; pos < next_beg; ++pos) {
-      Operand operand {};
-      operand.operand_ty = OPERAND_TYPE_LITERAL;
-      operand.value = *pos;
-      instr.operands.emplace_back(std::move(operand));
+      instr.operands.emplace_back(*pos);
     }
     beg = next_beg;
-    out.instrs.emplace_back(instr);
+    out.instrs.emplace_back(std::make_shared<Instruction>(instr));
   }
 
   return out;
@@ -70,11 +74,11 @@ std::vector<uint32_t> serialize_spv(const SpirvBinary& spv) {
   out.emplace_back(spv.reserved);
 
   for (const auto& instr : spv.instrs) {
-    uint32_t instr_size = instr.operands.size() + 1;
-    uint32_t instr_header = (instr.opcode & 0xFFFF) + (instr_size << 16);
+    uint32_t instr_size = instr->operands.size() + 1;
+    uint32_t instr_header = (instr->opcode & 0xFFFF) + (instr_size << 16);
     out.emplace_back(instr_header);
-    for (const auto& operand : instr.operands) {
-      out.emplace_back(operand.value);
+    for (const auto& operand : instr->operands) {
+      out.emplace_back(operand);
     }
   }
 
