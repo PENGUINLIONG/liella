@@ -15,16 +15,25 @@ enum OperandType {
   OPERAND_TYPE_STRONG_REF,
 };
 struct OperandIterator {
-  const uint32_t* inner;
+  const uint32_t* pos;
+  const uint32_t* end;
 
-  uint32_t u32() { return *(inner++); }
-  spv::Id id() { return (spv::Id)*(inner++); }
+  inline uint32_t u32() { return *(pos++); }
+  inline spv::Id id() { return (spv::Id)*(pos++); }
+
+  inline bool ate() const { return pos == end; }
 };
 struct Instruction {
   spv::Op opcode;
   std::vector<uint32_t> operands;
 
-  OperandIterator iter() const { return OperandIterator { operands.data() }; }
+  inline OperandIterator iter() const {
+    return OperandIterator {
+      operands.data(),
+      operands.data() + operands.size()
+    };
+  }
+  inline bool is(spv::Op op) const { return opcode == op; }
 };
 
 struct SpirvBinary {
@@ -33,7 +42,7 @@ struct SpirvBinary {
   uint32_t generator_magic;
   uint32_t bound;
   uint32_t reserved;
-  std::vector<std::shared_ptr<Instruction>> instrs;
+  std::vector<Instruction> instrs;
 };
 
 SpirvBinary deserialize_spv(const std::vector<uint32_t>& spv) {
@@ -59,7 +68,7 @@ SpirvBinary deserialize_spv(const std::vector<uint32_t>& spv) {
       instr.operands.emplace_back(*pos);
     }
     beg = next_beg;
-    out.instrs.emplace_back(std::make_shared<Instruction>(instr));
+    out.instrs.emplace_back(instr);
   }
 
   return out;
@@ -74,10 +83,10 @@ std::vector<uint32_t> serialize_spv(const SpirvBinary& spv) {
   out.emplace_back(spv.reserved);
 
   for (const auto& instr : spv.instrs) {
-    uint32_t instr_size = instr->operands.size() + 1;
-    uint32_t instr_header = (instr->opcode & 0xFFFF) + (instr_size << 16);
+    uint32_t instr_size = instr.operands.size() + 1;
+    uint32_t instr_header = (instr.opcode & 0xFFFF) + (instr_size << 16);
     out.emplace_back(instr_header);
-    for (const auto& operand : instr->operands) {
+    for (const auto& operand : instr.operands) {
       out.emplace_back(operand);
     }
   }
