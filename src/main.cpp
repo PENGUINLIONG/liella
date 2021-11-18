@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include "liella/spv-instr.hpp"
 #include "liella/collect-id-refs.hpp"
 
@@ -35,10 +36,12 @@ typedef uint32_t InstrIdx;
 struct CodeBlock {
   InstrIdx beg;
   InstrIdx end;
+  std::vector<spv::Id> branch_target_ids;
 };
 struct Loop {
   spv::Id merge_block;
   spv::Id continue_block;
+  std::vector<spv::Id> body_blocks;
   spv::LoopControlMask loop_ctrl;
 };
 struct IterVar {
@@ -76,8 +79,13 @@ struct Context {
 
   // Provided by `CodeBlockExtractor`.
   std::map<spv::Id, CodeBlock> code_block_by_label_id;
-  const CodeBlock& get_code_block_by_id(spv::Id id) const {
+  std::map<InstrIdx, spv::Id> label_id_by_loop_merge_idx;
+  const CodeBlock& get_code_block_by_label_id(spv::Id id) const {
     return code_block_by_label_id.at(id);
+  }
+  const CodeBlock& get_code_block_by_loop_merge_idx(InstrIdx loop_merge_idx) const {
+    spv::Id label_id = label_id_by_loop_merge_idx.at(loop_merge_idx);
+    return get_code_block_by_label_id(label_id);
   }
 
   // Provided by `LoopExtractor`.
@@ -186,29 +194,95 @@ struct ExprExtractor : public SpirvVisitor {
   }
 };
 
+struct OpLabel {
+  static constexpr spv::Op OP = spv::OpBranch;
+  spv::Id result_id;
+
+  static OpLabel parse(OperandIterator it) {
+    OpLabel out {};
+    out.result_id = it.id();
+    return out;
+  }
+};
+struct OpBranch {
+  static constexpr spv::Op OP = spv::OpBranch;
+  spv::Id target_label;
+
+  static OpBranch parse(OperandIterator it) {
+    OpBranch out {};
+    out.target_label = it.id();
+    return out;
+  }
+};
+struct OpBranchConditional {
+  static constexpr spv::Op OP = spv::OpBranchConditional;
+  spv::Id condition;
+  spv::Id true_label;
+  spv::Id false_label;
+
+  static OpBranchConditional parse(OperandIterator it) {
+    OpBranchConditional out {};
+    out.condition = it.id();
+    out.true_label = it.id();
+    out.false_label = it.id();
+    return out;
+  }
+};
+
 struct CodeBlockExtractor : public SpirvVisitor {
   uint32_t cur_blk_label_id;
+
+  CodeBlock& cur_blk() {
+    return ctxt().code_block_by_label_id[cur_blk_label_id];
+  }
+  void begin_blk(spv::Id label_id) {
+    assert(cur_blk_label_id == 0);
+    cur_blk_label_id = label_id;
+    cur_blk().beg = idx();
+  }
+  void end_blk() {
+    assert(cur_blk_label_id != 0);
+    cur_blk().end = idx() + 1;
+    cur_blk_label_id = 0;
+  }
   virtual void visit() override final {
     switch (opcode()) {
     case spv::OpLabel:
     {
-      assert(cur_blk_label_id == 0);
-      auto it = operands();
-      cur_blk_label_id = it.id();
-      ctxt().code_block_by_label_id[cur_blk_label_id].beg = idx();
+      OpLabel label {};
+      if (!ctxt().try_parse_instr(instr(), label)) { return; }
+      begin_blk(label.result_id);
+      break;
+    }
+    case spv::OpLoopMerge:
+    {
+      ctxt().label_id_by_loop_merge_idx[idx()] = cur_blk_label_id;
       break;
     }
     case spv::OpBranch:
+    {
+      OpBranch branch {};
+      if (!ctxt().try_parse_instr(instr(), branch)) { return; }
+      cur_blk().branch_target_ids.emplace_back(branch.target_label);
+      end_blk();
+      break;
+    }
     case spv::OpBranchConditional:
-    case spv::OpSwitch:
+    {
+      OpBranchConditional branch_conditional {};
+      if (!ctxt().try_parse_instr(instr(), branch_conditional)) { return; }
+      cur_blk().branch_target_ids.emplace_back(branch_conditional.true_label);
+      cur_blk().branch_target_ids.emplace_back(branch_conditional.false_label);
+      end_blk();
+      break;
+    }
+    case spv::OpSwitch: std::abort(); break;// TODO:
     case spv::OpReturn:
     case spv::OpReturnValue:
     case spv::OpKill:
     case spv::OpUnreachable:
     {
-      assert(cur_blk_label_id != 0);
-      ctxt().code_block_by_label_id[cur_blk_label_id].end = idx() + 1;
-      cur_blk_label_id = 0;
+      end_blk();
       break;
     }
     default: break;
@@ -231,14 +305,32 @@ struct OpLoopMerge {
   }
 };
 
+// -----------------------------------------------------------------------------
+
 struct LoopExtractor : public SpirvVisitor {
+  void collect_ctrl_flow_ring_blks_impl(
+    std::set<spv::Id>& body_blks,
+    std::vector<spv::Id>& blk_stack,
+
+    spv::Id target_label_id
+  ) {
+    if (target_label_id == )
+  }
+  std::vector<spv::Id> collect_ctrl_flow_ring_blks(spv::Id loop_merge_id) {
+    std::vector<spv::Id> loop_merge_id;
+    std::set<spv::Id> loop_merge_id;
+  }
+
   virtual void visit() override final {
     OpLoopMerge loop_merge;
     if (!ctxt().try_parse_instr(instr(), loop_merge)) { return; }
 
+    const CodeBlock& blks = ctrl_flow_ring_blks(loop_merge);
+
     Loop loop {};
     loop.merge_block = loop_merge.merge_block;
     loop.continue_block = loop_merge.continue_block;
+    loop.body_blocks = ;
     loop.loop_ctrl = loop_merge.loop_ctrl;
     ctxt().loop_by_loop_merge_id[idx()] = std::move(loop);
   }
