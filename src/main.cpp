@@ -7,6 +7,7 @@
 #include <vector>
 #include <map>
 #include "liella/spv-instr.hpp"
+#include "liella/collect-id-refs.hpp"
 
 std::vector<uint32_t> load_spv(const std::string& path) {
   std::ifstream is(path, std::ios::in | std::ios::ate | std::ios::binary);
@@ -83,6 +84,12 @@ struct Context {
   std::map<spv::Id, Loop> loop_by_loop_merge_id;
   const Loop& get_loop_by_id(spv::Id id) const {
     return loop_by_loop_merge_id.at(id);
+  }
+
+  // Provided by `IdDependencyExtractor`.
+  std::vector<std::vector<spv::Id>> dependencies_by_instr_idx;
+  const std::vector<spv::Id>& get_instr_dependencies(InstrIdx idx) {
+    return dependencies_by_instr_idx[idx];
   }
 
   // Provided by `IterVarExtractor`.
@@ -237,6 +244,12 @@ struct LoopExtractor : public SpirvVisitor {
   }
 };
 
+struct IdDependencyExtractor : public SpirvVisitor {
+  virtual void visit() override final {
+    ctxt().dependencies_by_instr_idx.emplace_back(liella::collect_id_refs(instr()));
+  }
+};
+
 // -----------------------------------------------------------------------------
 
 struct OpIAdd {
@@ -344,11 +357,13 @@ SpirvBinary process(const SpirvBinary& spv) {
   ExprExtractor expr_extractor {};
   CodeBlockExtractor block_extractor {};
   LoopExtractor loop_extractor {};
+  IdDependencyExtractor id_dependency_extractor {};
 
   SpirvPass(ctxt)
     .with_visitor(expr_extractor)
     .with_visitor(block_extractor)
     .with_visitor(loop_extractor)
+    .with_visitor(id_dependency_extractor)
     .apply(spv.instrs);
 
   for (const auto& pair : ctxt.loop_by_loop_merge_id) {

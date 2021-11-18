@@ -1,6 +1,7 @@
 // # SPIR-V Instruction Utilities
 // @PENGUINLIONG
 #pragma once
+#include <cassert>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -20,6 +21,15 @@ struct OperandIterator {
 
   inline uint32_t u32() { return *(pos++); }
   inline spv::Id id() { return (spv::Id)*(pos++); }
+  inline const char* str() {
+    const char* out = (const char*)pos;
+    do {
+      if ((*out >> 24) == 0) {
+        break;
+      }
+    } while (!ate());
+    return out;
+  }
 
   inline bool ate() const { return pos == end; }
 };
