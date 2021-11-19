@@ -10,11 +10,6 @@
 
 namespace liella {
 
-enum OperandType {
-  OPERAND_TYPE_LITERAL,
-  OPERAND_TYPE_WEAK_REF,
-  OPERAND_TYPE_STRONG_REF,
-};
 struct OperandIterator {
   const uint32_t* pos;
   const uint32_t* end;
