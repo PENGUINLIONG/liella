@@ -40,7 +40,7 @@ struct CodeBlock {
   std::vector<spv::Id> branch_target_ids;
 };
 struct IterVar {
-  spv::Id var;
+  spv::Id id;
   uint32_t stride;
 };
 struct Loop {
@@ -48,7 +48,10 @@ struct Loop {
   spv::Id continue_block;
   std::vector<spv::Id> body_blocks;
   spv::LoopControlMask loop_ctrl;
-  std::vector<IterVar> itervars;
+  std::vector<spv::Id> itervar_ids;
+};
+struct InstrLoopDependency {
+  std::set<spv::Id> itervar_ids;
 };
 struct Context {
   // Common properties filled in `apply`.
@@ -69,8 +72,11 @@ struct Context {
 
   // Provided by `ExprExtractor`.
   std::map<spv::Id, InstrIdx> instr_idx_by_result_id;
+  InstrIdx get_instr_idx_by_id(spv::Id id) const {
+    return instr_idx_by_result_id.at(id);
+  }
   const Instruction& get_instr_by_id(spv::Id id) const {
-    return get_instr_by_idx(instr_idx_by_result_id.at(id));
+    return get_instr_by_idx(get_instr_idx_by_id(id));
   }
   template<typename TOp>
   bool try_parse_instr_by_id(spv::Id id, TOp& out) {
@@ -88,17 +94,36 @@ struct Context {
     return get_code_block_by_label_id(label_id);
   }
 
+  // Provided by `IdDependencyExtractor`.
+  std::vector<std::vector<spv::Id>> dependencies_by_instr_idx;
+  const std::vector<spv::Id>& get_instr_dependencies_by_idx(InstrIdx idx) {
+    return dependencies_by_instr_idx[idx];
+  }
+  const std::vector<spv::Id>& get_instr_dependencies_by_id(spv::Id id) {
+    return get_instr_dependencies_by_idx(get_instr_idx_by_id(id));
+  }
+
   // Provided by `LoopExtractor`.
   std::map<spv::Id, Loop> loop_by_loop_merge_idx;
+  std::map<spv::Id, IterVar> itervar_by_id;
   const Loop& get_loop_by_idx(InstrIdx idx) const {
     return loop_by_loop_merge_idx.at(idx);
   }
-
-  // Provided by `IdDependencyExtractor`.
-  std::vector<std::vector<spv::Id>> dependencies_by_instr_idx;
-  const std::vector<spv::Id>& get_instr_dependencies(InstrIdx idx) {
-    return dependencies_by_instr_idx[idx];
+  bool is_id_itervar(spv::Id id) const {
+    return itervar_by_id.find(id) != itervar_by_id.end();
   }
+
+  // Provided by `LoopDependencySolver`.
+  std::vector<InstrLoopDependency> instr_loop_dependencies;
+  const InstrLoopDependency& get_instr_loop_dependencies(
+    InstrIdx idx
+  ) const {
+    return instr_loop_dependencies.at(idx);
+  }
+  bool is_instr_loop_invariant(InstrIdx idx) const {
+    return get_instr_loop_dependencies(idx).itervar_ids.empty();
+  }
+
 };
 
 struct SpirvVisitor {
@@ -295,6 +320,12 @@ struct CodeBlockExtractor : public SpirvVisitor {
   }
 };
 
+struct IdDependencyExtractor : public SpirvVisitor {
+  virtual void visit() override final {
+    ctxt().dependencies_by_instr_idx.emplace_back(liella::collect_id_refs(instr()));
+  }
+};
+
 // -----------------------------------------------------------------------------
 
 struct OpIAdd {
@@ -360,8 +391,9 @@ struct OpStore {
 
 // Apply this only to instruction in continue blocks.
 struct IterVarExtractor : public SpirvVisitor {
-  std::vector<IterVar>* itervars;
-  IterVarExtractor(std::vector<IterVar>& itervars) : itervars(&itervars) {}
+  std::vector<spv::Id>* itervar_ids;
+  IterVarExtractor(std::vector<spv::Id>& itervar_ids) :
+    itervar_ids(&itervar_ids) {}
 
   virtual void visit() override final {
     OpStore store;
@@ -388,9 +420,10 @@ struct IterVarExtractor : public SpirvVisitor {
     if (store.pointer != load.pointer) { return; }
 
     IterVar out {};
-    out.var = store.pointer;
+    out.id = store.pointer;
     out.stride = stride;
-    itervars->emplace_back(std::move(out));
+    ctxt().itervar_by_id[store.pointer] = std::move(out);
+    itervar_ids->emplace_back(idx());
   }
 };
 
@@ -467,8 +500,8 @@ struct LoopExtractor : public SpirvVisitor {
       body_blocks.emplace_back(blk);
     }
 
-    std::vector<IterVar> itervars;
-    IterVarExtractor itervar_extractor(itervars);
+    std::vector<spv::Id> itervar_ids;
+    IterVarExtractor itervar_extractor(itervar_ids);
 
     const CodeBlock& code_block =
       ctxt().get_code_block_by_label_id(loop_merge.continue_block);
@@ -482,14 +515,58 @@ struct LoopExtractor : public SpirvVisitor {
     loop.continue_block = loop_merge.continue_block;
     loop.body_blocks = std::move(body_blocks);
     loop.loop_ctrl = loop_merge.loop_ctrl;
-    loop.itervars = std::move(itervars);
+    loop.itervar_ids = std::move(itervar_ids);
     ctxt().loop_by_loop_merge_idx[idx()] = std::move(loop);
   }
 };
 
-struct IdDependencyExtractor : public SpirvVisitor {
+struct Fvn {
+  static constexpr uint64_t FVN_OFFSET_BIAS = 0xcbf29ce484222325;
+  static constexpr uint64_t FVN_PRIME = 0x100000001b3;
+  uint64_t hash = FVN_OFFSET_BIAS;
+  inline void feed(const void* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+      hash = hash ^ (uint64_t)*(const uint8_t*)data;
+      hash = hash * FVN_PRIME;
+    }
+  }
+  template<typename T>
+  inline void feed(const T& data) {
+    feed(&data, sizeof(T));
+  }
+};
+
+struct InstrLoopDependencyExtractor : public SpirvVisitor {
   virtual void visit() override final {
-    ctxt().dependencies_by_instr_idx.emplace_back(liella::collect_id_refs(instr()));
+    std::set<spv::Id> itervar_ids;
+
+    const auto& ref_ids = ctxt().get_instr_dependencies_by_idx(idx());
+
+    for (auto ref_id : ref_ids) {
+      if (ctxt().is_id_itervar(ref_id)) {
+        itervar_ids.emplace(ref_id);
+      } else {
+        auto idx = ctxt().get_instr_idx_by_id(ref_id);
+        // It's possible to have a forward reference that `idx` is beyond the
+        // current instruction index, so even though such reference might refer
+        // to iteration variables, we only have an empty cache in
+        // `ctxt().instr_loop_dependencies` at the moment.
+        //
+        // In most cases such forward reference is used for attribution and
+        // debug info, so we can safely ignore them. Just be aware of this.
+        if (idx >= this->idx()) { continue; }
+
+        const auto& cached_itervar_ids =
+          ctxt().get_instr_loop_dependencies(idx).itervar_ids;
+        for (spv::Id itervar_id : cached_itervar_ids) {
+          itervar_ids.emplace(itervar_id);
+        }
+      }
+    }
+
+    InstrLoopDependency out {};
+    out.itervar_ids = std::move(itervar_ids);
+    ctxt().instr_loop_dependencies.emplace_back(std::move(out));
   }
 };
 
@@ -513,6 +590,13 @@ SpirvBinary process(const SpirvBinary& spv) {
   SpirvPass(ctxt)
     .with_visitor(loop_extractor)
     .apply(spv.instrs);
+
+  InstrLoopDependencyExtractor instr_loop_dependency_extractor {};
+
+  SpirvPass(ctxt)
+    .with_visitor(instr_loop_dependency_extractor)
+    .apply(spv.instrs);
+
   return spv;
 }
 

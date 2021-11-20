@@ -19,7 +19,7 @@ struct OperandIterator {
   inline const char* str() {
     const char* out = (const char*)pos;
     do {
-      if ((*out >> 24) == 0) {
+      if ((*(pos++) >> 24) == 0) {
         break;
       }
     } while (!ate());
