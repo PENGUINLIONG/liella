@@ -9,6 +9,7 @@
 #include <set>
 #include "liella/spv-instr.hpp"
 #include "liella/collect-id-refs.hpp"
+#include "liella/hash-instr.hpp"
 
 std::vector<uint32_t> load_spv(const std::string& path) {
   std::ifstream is(path, std::ios::in | std::ios::ate | std::ios::binary);
@@ -50,8 +51,9 @@ struct Loop {
   spv::LoopControlMask loop_ctrl;
   std::vector<spv::Id> itervar_ids;
 };
-struct InstrLoopDependency {
+struct InstrAttribute {
   std::set<spv::Id> itervar_ids;
+  uint64_t hash;
 };
 struct Context {
   // Common properties filled in `apply`.
@@ -71,6 +73,7 @@ struct Context {
   }
 
   // Provided by `ExprExtractor`.
+  std::vector<bool> has_results;
   std::map<spv::Id, InstrIdx> instr_idx_by_result_id;
   InstrIdx get_instr_idx_by_id(spv::Id id) const {
     return instr_idx_by_result_id.at(id);
@@ -113,15 +116,19 @@ struct Context {
     return itervar_by_id.find(id) != itervar_by_id.end();
   }
 
-  // Provided by `LoopDependencySolver`.
-  std::vector<InstrLoopDependency> instr_loop_dependencies;
-  const InstrLoopDependency& get_instr_loop_dependencies(
-    InstrIdx idx
-  ) const {
-    return instr_loop_dependencies.at(idx);
+  // Provided by `InstrAttributeExtractor`.
+  std::vector<InstrAttribute> instr_attribute_by_idx;
+  bool is_instr_attribute_available_for_idx(InstrIdx idx) const {
+    return idx < instr_attribute_by_idx.size();
   }
-  bool is_instr_loop_invariant(InstrIdx idx) const {
-    return get_instr_loop_dependencies(idx).itervar_ids.empty();
+  const InstrAttribute& get_instr_attribute_by_idx(InstrIdx idx) const {
+    return instr_attribute_by_idx.at(idx);
+  }
+  const std::set<spv::Id>& get_instr_loop_dependencies(InstrIdx idx) const {
+    return get_instr_attribute_by_idx(idx).itervar_ids;
+  }
+  uint64_t get_stmt_hash(InstrIdx idx) const {
+    return get_instr_attribute_by_idx(idx).hash;
   }
 
 };
@@ -209,6 +216,7 @@ struct ExprExtractor : public SpirvVisitor {
     bool has_result = false;
     bool has_result_ty = false;
     spv::HasResultAndType(opcode(), &has_result, &has_result_ty);
+    ctxt().has_results.emplace_back(has_result);
     if (has_result) {
       auto it = operands();
       if (has_result_ty) {
@@ -520,23 +528,7 @@ struct LoopExtractor : public SpirvVisitor {
   }
 };
 
-struct Fvn {
-  static constexpr uint64_t FVN_OFFSET_BIAS = 0xcbf29ce484222325;
-  static constexpr uint64_t FVN_PRIME = 0x100000001b3;
-  uint64_t hash = FVN_OFFSET_BIAS;
-  inline void feed(const void* data, size_t size) {
-    for (size_t i = 0; i < size; ++i) {
-      hash = hash ^ (uint64_t)*(const uint8_t*)data;
-      hash = hash * FVN_PRIME;
-    }
-  }
-  template<typename T>
-  inline void feed(const T& data) {
-    feed(&data, sizeof(T));
-  }
-};
-
-struct InstrLoopDependencyExtractor : public SpirvVisitor {
+struct InstrAttributeExtractor : public SpirvVisitor {
   virtual void visit() override final {
     std::set<spv::Id> itervar_ids;
 
@@ -554,19 +546,23 @@ struct InstrLoopDependencyExtractor : public SpirvVisitor {
         //
         // In most cases such forward reference is used for attribution and
         // debug info, so we can safely ignore them. Just be aware of this.
-        if (idx >= this->idx()) { continue; }
-
-        const auto& cached_itervar_ids =
-          ctxt().get_instr_loop_dependencies(idx).itervar_ids;
-        for (spv::Id itervar_id : cached_itervar_ids) {
-          itervar_ids.emplace(itervar_id);
+        if (ctxt().is_instr_attribute_available_for_idx(idx)) {
+          const auto& cached_itervar_ids =
+            ctxt().get_instr_loop_dependencies(idx);
+          for (spv::Id itervar_id : cached_itervar_ids) {
+            itervar_ids.emplace(itervar_id);
+          }
         }
       }
     }
 
-    InstrLoopDependency out {};
+    Fnv hasher;
+    liella::hash_instr(hasher, instr());
+
+    InstrAttribute out {};
     out.itervar_ids = std::move(itervar_ids);
-    ctxt().instr_loop_dependencies.emplace_back(std::move(out));
+    out.hash = hasher.hash;
+    ctxt().instr_attribute_by_idx.emplace_back(std::move(out));
   }
 };
 
@@ -591,11 +587,13 @@ SpirvBinary process(const SpirvBinary& spv) {
     .with_visitor(loop_extractor)
     .apply(spv.instrs);
 
-  InstrLoopDependencyExtractor instr_loop_dependency_extractor {};
+  InstrAttributeExtractor instr_loop_dependency_extractor {};
 
   SpirvPass(ctxt)
     .with_visitor(instr_loop_dependency_extractor)
     .apply(spv.instrs);
+
+  SpirvPass(ctxt)
 
   return spv;
 }
