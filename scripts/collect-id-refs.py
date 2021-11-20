@@ -151,6 +151,7 @@ HASH_INSTR = {
         "  hasher.feed(instr.opcode);\n"
     ],
     "footer": [
+        "  while (!it.ate()) hasher.feed(it.u32());"
         "}\n",
     ],
     "kind": {

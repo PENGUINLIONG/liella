@@ -3980,6 +3980,6 @@ void hash_instr(Fnv& hasher, const Instruction& instr) {
     while (!it.ate()) it.id(); hasher.feed(0);
     break;
   }
-}
+  while (!it.ate()) hasher.feed(it.u32());}
 
 } // namespace liella
