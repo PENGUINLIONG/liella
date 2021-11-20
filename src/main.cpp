@@ -34,6 +34,14 @@ using namespace liella;
 
 typedef uint32_t InstrIdx;
 
+// To get an `InstrHash`, feed the hasher with literal operands and zero-feed
+// with zero if the operand is an ID reference, in specification order.
+// instruction.
+typedef uint64_t InstrHash;
+// Feed the hasher first with an `InstrHash` and then the `InstrHash`es of all
+// ID-referenced instruction we skipped before.
+typedef uint64_t DerefInstrHash;
+
 struct CodeBlock {
   spv::Id label_id;
   InstrIdx beg;
@@ -53,7 +61,17 @@ struct Loop {
 };
 struct InstrAttribute {
   std::set<spv::Id> itervar_ids;
-  uint64_t hash;
+  InstrHash hash;
+  DerefInstrHash deref_hash;
+};
+//        (+ _ (* _ _))
+//               \
+//          (+ 1 (* _ _))
+//               / \
+//  (+ 1 (* 2 3))   (+ 1 (* 4 5))
+struct InstrHashTree {
+  std::vector<InstrIdx> instrs;
+  std::map<DerefInstrHash, std::vector<InstrHashTree>> variants;
 };
 struct Context {
   // Common properties filled in `apply`.
@@ -84,6 +102,12 @@ struct Context {
   template<typename TOp>
   bool try_parse_instr_by_id(spv::Id id, TOp& out) {
     return try_parse_instr(get_instr_by_id(id), out);
+  }
+  bool is_instr_stmt(InstrIdx idx) const {
+    return has_results.at(idx) == false;
+  }
+  bool is_instr_expr(InstrIdx idx) const {
+    return has_results.at(idx) == true;
   }
 
   // Provided by `CodeBlockExtractor`.
@@ -127,9 +151,18 @@ struct Context {
   const std::set<spv::Id>& get_instr_loop_dependencies(InstrIdx idx) const {
     return get_instr_attribute_by_idx(idx).itervar_ids;
   }
-  uint64_t get_stmt_hash(InstrIdx idx) const {
+  InstrHash get_instr_hash_by_idx(InstrIdx idx) const {
     return get_instr_attribute_by_idx(idx).hash;
   }
+  InstrHash get_instr_hash_by_id(spv::Id id) const {
+    return get_instr_attribute_by_idx(get_instr_idx_by_id(id)).hash;
+  }
+  InstrHash get_deref_instr_hash_by_idx(InstrIdx idx) const {
+    return get_instr_attribute_by_idx(idx).deref_hash;
+  }
+
+  // Provided by `InstrHashForestBuilder`.
+  InstrHashTree instr_hash_tree_root;
 
 };
 
@@ -556,13 +589,66 @@ struct InstrAttributeExtractor : public SpirvVisitor {
       }
     }
 
-    Fnv hasher;
-    liella::hash_instr(hasher, instr());
+    InstrHash instr_hash;
+    {
+      Fnv hasher {};
+      liella::hash_instr(hasher, instr());
+      instr_hash = hasher.hash;
+    }
+    DerefInstrHash deref_instr_hash;
+    {
+      Fnv hasher {};
+      hasher.feed(instr_hash);
+      for (spv::Id dep_id : ctxt().get_instr_dependencies_by_idx(idx())) {
+        auto idx = ctxt().get_instr_idx_by_id(dep_id);
+        // Still we ignore forward references here.
+        if (idx < this->idx()) {
+          hasher.feed(ctxt().get_instr_hash_by_idx(idx));
+        } else {
+          hasher.feed(0);
+        }
+      }
+      deref_instr_hash = hasher.hash;
+    }
+
 
     InstrAttribute out {};
     out.itervar_ids = std::move(itervar_ids);
-    out.hash = hasher.hash;
+    out.hash = instr_hash;
+    out.deref_hash = deref_instr_hash;
     ctxt().instr_attribute_by_idx.emplace_back(std::move(out));
+  }
+};
+
+// -----------------------------------------------------------------------------
+
+
+struct InstrHashForestBuilder : public SpirvVisitor {
+  void build_instr_hash_tree_impl(InstrHashTree& tree, InstrIdx idx) {
+    tree.instrs.emplace_back(idx);
+    auto deref_instr_hash = ctxt().get_deref_instr_hash_by_idx(idx);
+
+    if (tree.variants.find(deref_instr_hash) == tree.variants.end()) {
+      // Such variant has not been registered before, create a new one.
+      std::vector<InstrHashTree> variant;
+
+      for (spv::Id dep_id : ctxt().get_instr_dependencies_by_idx(idx)) {
+        InstrHashTree subtree;
+        build_instr_hash_tree_impl(subtree, ctxt().get_instr_idx_by_id(dep_id));
+        variant.emplace_back(std::move(subtree));
+      }
+      tree.variants[deref_instr_hash] = std::move(variant);
+    } else {
+      // The variant already exists, step in to register our `idx` in `instrs`.
+      auto dep_ids = ctxt().get_instr_dependencies_by_idx(idx);
+      auto variant = tree.variants[deref_instr_hash];
+      for (size_t i = 0; i < dep_ids.size(); ++i) {
+        build_instr_hash_tree_impl(variant[i], dep_ids[i]);
+      }
+    }
+  }
+  virtual void visit() override final {
+    build_instr_hash_tree_impl(ctxt().instr_hash_tree_root, idx());
   }
 };
 
@@ -593,7 +679,11 @@ SpirvBinary process(const SpirvBinary& spv) {
     .with_visitor(instr_loop_dependency_extractor)
     .apply(spv.instrs);
 
+  InstrHashForestBuilder instr_hash_forest_builder;
+
   SpirvPass(ctxt)
+    .with_visitor(instr_hash_forest_builder)
+    .apply(spv.instrs);
 
   return spv;
 }
