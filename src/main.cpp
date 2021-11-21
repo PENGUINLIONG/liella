@@ -127,7 +127,9 @@ struct Context {
   const CodeBlock& get_code_block_by_label_id(spv::Id id) const {
     return code_block_by_label_id.at(id);
   }
-  const CodeBlock& get_code_block_by_loop_merge_idx(InstrIdx loop_merge_idx) const {
+  const CodeBlock& get_code_block_by_loop_merge_idx(
+    InstrIdx loop_merge_idx
+  ) const {
     spv::Id label_id = label_id_by_loop_merge_idx.at(loop_merge_idx);
     return get_code_block_by_label_id(label_id);
   }
@@ -377,7 +379,8 @@ struct CodeBlockExtractor : public SpirvVisitor {
 
 struct IdDependencyExtractor : public SpirvVisitor {
   virtual void visit() override final {
-    ctxt().dependencies_by_instr_idx.emplace_back(liella::collect_id_refs(instr()));
+    std::vector<uint32_t> id_refs = liella::collect_id_refs(instr());
+    ctxt().dependencies_by_instr_idx.emplace_back(id_refs);
   }
 };
 
@@ -425,7 +428,8 @@ struct OpLoad {
     out.result_ty_id = it.id();
     out.result_id = it.id();
     out.pointer = it.id();
-    out.memory_operand = it.ate() ? spv::MemoryAccessMaskNone : (spv::MemoryAccessMask)it.u32();
+    out.memory_operand =
+      it.ate() ? spv::MemoryAccessMaskNone : (spv::MemoryAccessMask)it.u32();
     return out;
   }
 };
@@ -439,7 +443,8 @@ struct OpStore {
     OpStore out {};
     out.pointer = it.id();
     out.object = it.id();
-    out.memory_operand = it.ate() ? spv::MemoryAccessMaskNone : (spv::MemoryAccessMask)it.u32();
+    out.memory_operand =
+      it.ate() ? spv::MemoryAccessMaskNone : (spv::MemoryAccessMask)it.u32();
     return out;
   }
 };
@@ -637,7 +642,6 @@ struct InstrAttributeExtractor : public SpirvVisitor {
 
 // -----------------------------------------------------------------------------
 
-
 struct InstrHashForestBuilder : public SpirvVisitor {
   InstrHashTreeVariant build_variant(InstrIdx idx) {
     const Instruction& instr = ctxt().get_instr_by_idx(idx);
@@ -688,8 +692,9 @@ struct InstrHashForestBuilder : public SpirvVisitor {
   }
   void mark_instr(InstrIdx idx) {
     auto instr_hash = ctxt().get_instr_hash_by_idx(idx);
-    if (ctxt().instr_hash_forest.find(instr_hash) == ctxt().instr_hash_forest.end()) {
-      ctxt().instr_hash_forest[instr_hash] = build_tree(idx);
+    auto it = ctxt().instr_hash_forest.find(instr_hash);
+    if (it == ctxt().instr_hash_forest.end()) {
+      ctxt().instr_hash_forest.emplace_hint(it, build_tree(idx));
     }
     mark_tree(ctxt().instr_hash_forest[instr_hash], idx);
   }
@@ -702,7 +707,10 @@ struct InstrHashForestBuilder : public SpirvVisitor {
 
 // -----------------------------------------------------------------------------
 
-void dbg_print_instr_hash_tree_impl(const InstrHashTree& tree, std::stringstream& ss) {
+void dbg_print_instr_hash_tree_impl(
+  const InstrHashTree& tree,
+  std::stringstream& ss
+) {
   bool first = true;
   for (const auto& variant : tree.variants) {
     if (first) {
