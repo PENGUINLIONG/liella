@@ -176,9 +176,12 @@ struct Context {
   InstrHash get_deref_instr_hash_by_idx(InstrIdx idx) const {
     return get_instr_attribute_by_idx(idx).deref_hash;
   }
+  InstrHash get_deref_instr_hash_by_id(spv::Id id) const {
+    return get_instr_attribute_by_idx(get_instr_idx_by_id(id)).deref_hash;
+  }
 
   // Provided by `InstrHashForestBuilder`.
-  std::map<InstrIdx, InstrHashTree> instr_hash_forest;
+  std::map<InstrHash, InstrHashTree> instr_hash_forest;
 
 };
 
@@ -690,17 +693,135 @@ struct InstrHashForestBuilder : public SpirvVisitor {
       mark_tree(operand_tree, ctxt().get_instr_idx_by_id(dep_id));
     }
   }
-  void mark_instr(InstrIdx idx) {
-    auto instr_hash = ctxt().get_instr_hash_by_idx(idx);
+  virtual void visit() override final {
+    auto instr_hash = ctxt().get_instr_hash_by_idx(idx());
     auto it = ctxt().instr_hash_forest.find(instr_hash);
     if (it == ctxt().instr_hash_forest.end()) {
-      ctxt().instr_hash_forest.emplace_hint(it, build_tree(idx));
+      auto pair = std::make_pair(instr_hash, build_tree(idx()));
+      ctxt().instr_hash_forest.emplace_hint(it, std::move(pair));
     }
-    mark_tree(ctxt().instr_hash_forest[instr_hash], idx);
+    mark_tree(ctxt().instr_hash_forest[instr_hash], idx());
   }
+};
+
+// TODO: (penguinliong)
+// 1. Identify implicit loops and merge them as one itervar-controlled
+//    instruction bundle.
+// 2. Identify ranged structured loops and merge the instructions within as one
+//    or more itervar-controlled instruction bundle.
+
+// Implicit loops are sequential statements differs to each other only by a
+// constant or a itervar-constexpr operand.
+struct ImplicitLoopFinder : public SpirvVisitor {
+  struct DiffPoint {
+    uint32_t ref_pos;
+    InstrIdx ia;
+    InstrIdx ib;
+  };
+  void stmt_diff_impl(
+    InstrIdx ia,
+    InstrIdx ib,
+    std::vector<DiffPoint>& diff_pts,
+    uint32_t& ref_pos_counter
+  ) {
+    uint32_t ref_pos = ref_pos_counter++;
+    InstrHash a_hash = ctxt().get_instr_hash_by_idx(ia);
+    InstrHash b_hash = ctxt().get_instr_hash_by_idx(ib);
+    if (a_hash != b_hash) {
+      DiffPoint diff_pt {};
+      diff_pt.ref_pos = ref_pos;
+      diff_pt.ia = ia;
+      diff_pt.ib = ib;
+      diff_pts.emplace_back(diff_pt);
+    } else {
+      const auto& a_deps = ctxt().get_instr_dependencies_by_idx(ia);
+      const auto& b_deps = ctxt().get_instr_dependencies_by_idx(ib);
+      assert(a_deps.size() == b_deps.size());
+      for (size_t i = 0; i < a_deps.size(); ++i) {
+        auto a_dep_idx = ctxt().get_instr_idx_by_id(a_deps[i]);
+        auto b_dep_idx = ctxt().get_instr_idx_by_id(b_deps[i]);
+        stmt_diff_impl(a_dep_idx, b_dep_idx, diff_pts, ref_pos_counter);
+      }
+    }
+  }
+  std::vector<DiffPoint> stmt_diff(InstrIdx ia, InstrIdx ib) {
+    uint32_t ref_pos_counter = 0;
+    std::vector<DiffPoint> diff_pts {};
+    stmt_diff_impl(ia, ib, diff_pts, ref_pos_counter);
+    return diff_pts;
+  }
+
+  struct ImplicitLoop {
+    InstrIdx beg = 0;
+    InstrIdx end = 0;
+    int64_t stride = -1;
+
+    constexpr uint32_t nunroll() const {
+      return (end - beg);
+    }
+  };
+  std::vector<ImplicitLoop> implicit_loops;
   virtual void visit() override final {
-    if (ctxt().is_instr_stmt(idx())) {
-      mark_instr(idx());
+    if (implicit_loops.empty()) {
+      implicit_loops.emplace_back();
+      return;
+    }
+
+    ImplicitLoop& implicit_loop = implicit_loops.back();
+
+    bool is_similar = true;
+    int64_t expected_stride = -1;
+    auto diff_pts = stmt_diff(implicit_loop.beg, idx());
+    for (auto diff_pt : diff_pts) {
+      const Instruction& a = ctxt().get_instr_by_idx(diff_pt.ia);
+      const Instruction& b = ctxt().get_instr_by_idx(diff_pt.ib);
+
+      if (a.is(spv::OpConstant) && b.is(spv::OpConstant)) {
+        auto a_op = OpConstant::parse(a.iter());
+        auto b_op = OpConstant::parse(b.iter());
+        int64_t stride = std::abs(a_op.literal - b_op.literal);
+
+        if (expected_stride < 0) {
+          expected_stride = stride;
+        } else {
+          is_similar &= expected_stride == stride;
+        }
+
+        auto a_ty_deref_hash =
+          ctxt().get_deref_instr_hash_by_id(a_op.result_ty_id);
+        auto b_ty_deref_hash =
+          ctxt().get_deref_instr_hash_by_id(b_op.result_ty_id);
+        is_similar &= a_ty_deref_hash == b_ty_deref_hash;
+      } else {
+        is_similar = false;
+        break;
+      }
+    }
+
+    if (implicit_loop.stride < 0) {
+      // It's possible this `stride` assigned with `-1` when the instructions
+      // are exactly the same. It's common when multiple variables of the same
+      // type being allocated.
+      implicit_loop.stride = expected_stride;
+    } else {
+      int64_t long_stride = implicit_loop.stride * implicit_loop.nunroll();
+      is_similar &= long_stride == expected_stride;
+    }
+
+    if (is_similar) {
+      implicit_loop.end = idx() + 1;
+    } else {
+      if (implicit_loop.beg == idx() - 1) {
+        // Reuse the last structure if the current instruction pair doesn't form
+        // an implicit loop.
+        implicit_loop.beg = idx();
+        implicit_loop.end = 0;
+      } else {
+        // Otherwise, close the implicit loop because there is no other similar
+        // statements following.
+        implicit_loops.emplace_back();
+        implicit_loops.back().beg = idx();
+      }
     }
   }
 };
@@ -774,6 +895,16 @@ SpirvBinary process(const SpirvBinary& spv) {
     .apply(spv.instrs);
 
   std::cout << dbg_print_instr_hash_tree(ctxt);
+
+  ImplicitLoopFinder implicit_loop_finder;
+
+  SpirvPass(ctxt).with_visitor(implicit_loop_finder)
+    .apply(spv.instrs);
+
+  if (implicit_loop_finder.implicit_loops.back().end == 0) {
+    implicit_loop_finder.implicit_loops
+      .erase(implicit_loop_finder.implicit_loops.end() - 1);
+  }
 
   return spv;
 }

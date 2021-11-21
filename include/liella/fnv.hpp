@@ -11,7 +11,7 @@ struct Fnv {
   uint64_t hash = FVN_OFFSET_BIAS;
   inline void feed(const void* data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
-      hash = hash ^ (uint64_t)*(const uint8_t*)data;
+      hash = hash ^ (uint64_t)(((const uint8_t*)data)[i]);
       hash = hash * FVN_PRIME;
     }
   }
