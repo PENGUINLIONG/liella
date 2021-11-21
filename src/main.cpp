@@ -3,6 +3,7 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <map>
@@ -10,6 +11,7 @@
 #include "liella/spv-instr.hpp"
 #include "liella/collect-id-refs.hpp"
 #include "liella/hash-instr.hpp"
+#include "liella/op2name.hpp"
 
 std::vector<uint32_t> load_spv(const std::string& path) {
   std::ifstream is(path, std::ios::in | std::ios::ate | std::ios::binary);
@@ -174,7 +176,7 @@ struct Context {
   }
 
   // Provided by `InstrHashForestBuilder`.
-  InstrHashTree instr_hash_tree_root;
+  std::map<InstrIdx, InstrHashTree> instr_hash_forest;
 
 };
 
@@ -637,22 +639,6 @@ struct InstrAttributeExtractor : public SpirvVisitor {
 
 
 struct InstrHashForestBuilder : public SpirvVisitor {
-  /*
-  bool is_instr_itervar_const_expr(InstrIdx idx) {
-    const Instruction& instr = ctxt().get_instr_by_idx(idx);
-    bool are_subtrees_itervar_constexpr = true;
-    for (spv::Id dep_id : ctxt().get_instr_dependencies_by_idx(idx)) {
-      InstrHashTree subtree;
-      build_instr_hash_tree_impl(subtree, ctxt().get_instr_idx_by_id(dep_id));
-      are_subtrees_itervar_constexpr &= subtree.is_itervar_constexpr;
-      variant.emplace_back(std::move(subtree));
-    }
-    bool is_itervar_constexpr =
-      instr.is(spv::OpConstant) ||
-      ctxt().is_idx_itervar(idx) ||
-      (instr.is(spv::OpIAdd) && are_subtrees_itervar_constexpr);
-  }
-  */
   InstrHashTreeVariant build_variant(InstrIdx idx) {
     const Instruction& instr = ctxt().get_instr_by_idx(idx);
     auto dep_ids = ctxt().get_instr_dependencies_by_idx(idx);
@@ -700,20 +686,45 @@ struct InstrHashForestBuilder : public SpirvVisitor {
       mark_tree(operand_tree, ctxt().get_instr_idx_by_id(dep_id));
     }
   }
+  void mark_instr(InstrIdx idx) {
+    auto instr_hash = ctxt().get_instr_hash_by_idx(idx);
+    if (ctxt().instr_hash_forest.find(instr_hash) == ctxt().instr_hash_forest.end()) {
+      ctxt().instr_hash_forest[instr_hash] = build_tree(idx);
+    }
+    mark_tree(ctxt().instr_hash_forest[instr_hash], idx);
+  }
   virtual void visit() override final {
-    mark_tree(ctxt().instr_hash_tree_root, idx());
+    if (ctxt().is_instr_stmt(idx())) {
+      mark_instr(idx());
+    }
   }
 };
 
 // -----------------------------------------------------------------------------
 
-void dbg_print_instr_hash_tree(const InstrHashTree& tree, uint32_t depth, std::stringstream& ss) {
+void dbg_print_instr_hash_tree_impl(const InstrHashTree& tree, std::stringstream& ss) {
+  bool first = true;
   for (const auto& variant : tree.variants) {
-    variant.second;
+    if (first) {
+      first = false;
+    } else {
+      ss << ":";
+    }
+    ss << "(" << op2name(tree.op);
+    for (const auto& operand_tree : variant.second.operand_trees) {
+      ss << " ";
+      dbg_print_instr_hash_tree_impl(operand_tree, ss);
+    }
+    ss << ")";
   }
 }
-std::string dbg_print_instr_hash_tree(const InstrHashTree& tree) {
-  return {};
+std::string dbg_print_instr_hash_tree(const Context& ctxt) {
+  std::stringstream ss;
+  for (const auto& pair : ctxt.instr_hash_forest) {
+    dbg_print_instr_hash_tree_impl(pair.second, ss);
+    ss << std::endl;
+  }
+  return ss.str();
 }
 
 // A ramped statement is a sequence of statements to apply a same operation
@@ -753,6 +764,8 @@ SpirvBinary process(const SpirvBinary& spv) {
   SpirvPass(ctxt)
     .with_visitor(instr_hash_forest_builder)
     .apply(spv.instrs);
+
+  std::cout << dbg_print_instr_hash_tree(ctxt);
 
   return spv;
 }
