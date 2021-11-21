@@ -1,0 +1,5 @@
+#version 450
+void main() {
+    int i0 = 0;
+    int i1 = 1;
+}

@@ -39,8 +39,11 @@ typedef uint32_t InstrIdx;
 // instruction.
 typedef uint64_t InstrHash;
 // Feed the hasher first with an `InstrHash` and then the `InstrHash`es of all
-// ID-referenced instruction we skipped before.
+// directly ID-referenced instructions we skipped before.
 typedef uint64_t DerefInstrHash;
+// Feed the hasher with `InstrHash` and then `InstrHash`es of all directly or
+// indirectly ID referenced instructions.
+typedef uint64_t FullChainHash;
 
 struct CodeBlock {
   spv::Id label_id;
@@ -64,14 +67,20 @@ struct InstrAttribute {
   InstrHash hash;
   DerefInstrHash deref_hash;
 };
-//        (+ _ (* _ _))
+//           (+ _ _)
 //               \
 //          (+ 1 (* _ _))
 //               / \
 //  (+ 1 (* 2 3))   (+ 1 (* 4 5))
-struct InstrHashTree {
+struct InstrHashTree;
+struct InstrHashTreeVariant {
+  bool is_itervar_constexpr;
   std::vector<InstrIdx> instrs;
-  std::map<DerefInstrHash, std::vector<InstrHashTree>> variants;
+  std::vector<InstrHashTree> operand_trees;
+};
+struct InstrHashTree {
+  spv::Op op;
+  std::map<InstrHash, InstrHashTreeVariant> variants;
 };
 struct Context {
   // Common properties filled in `apply`.
@@ -132,12 +141,15 @@ struct Context {
 
   // Provided by `LoopExtractor`.
   std::map<spv::Id, Loop> loop_by_loop_merge_idx;
-  std::map<spv::Id, IterVar> itervar_by_id;
+  std::map<spv::Id, IterVar> itervar_by_idx;
   const Loop& get_loop_by_idx(InstrIdx idx) const {
     return loop_by_loop_merge_idx.at(idx);
   }
+  bool is_idx_itervar(InstrIdx idx) const {
+    return itervar_by_idx.find(idx) != itervar_by_idx.end();
+  }
   bool is_id_itervar(spv::Id id) const {
-    return itervar_by_id.find(id) != itervar_by_id.end();
+    return is_idx_itervar(get_instr_idx_by_id(id));
   }
 
   // Provided by `InstrAttributeExtractor`.
@@ -463,8 +475,9 @@ struct IterVarExtractor : public SpirvVisitor {
     IterVar out {};
     out.id = store.pointer;
     out.stride = stride;
-    ctxt().itervar_by_id[store.pointer] = std::move(out);
-    itervar_ids->emplace_back(idx());
+    auto idx = ctxt().get_instr_idx_by_id(store.pointer);
+    ctxt().itervar_by_idx[idx] = std::move(out);
+    itervar_ids->emplace_back(store.pointer);
   }
 };
 
@@ -624,35 +637,91 @@ struct InstrAttributeExtractor : public SpirvVisitor {
 
 
 struct InstrHashForestBuilder : public SpirvVisitor {
-  void build_instr_hash_tree_impl(InstrHashTree& tree, InstrIdx idx) {
-    tree.instrs.emplace_back(idx);
-    auto deref_instr_hash = ctxt().get_deref_instr_hash_by_idx(idx);
+  /*
+  bool is_instr_itervar_const_expr(InstrIdx idx) {
+    const Instruction& instr = ctxt().get_instr_by_idx(idx);
+    bool are_subtrees_itervar_constexpr = true;
+    for (spv::Id dep_id : ctxt().get_instr_dependencies_by_idx(idx)) {
+      InstrHashTree subtree;
+      build_instr_hash_tree_impl(subtree, ctxt().get_instr_idx_by_id(dep_id));
+      are_subtrees_itervar_constexpr &= subtree.is_itervar_constexpr;
+      variant.emplace_back(std::move(subtree));
+    }
+    bool is_itervar_constexpr =
+      instr.is(spv::OpConstant) ||
+      ctxt().is_idx_itervar(idx) ||
+      (instr.is(spv::OpIAdd) && are_subtrees_itervar_constexpr);
+  }
+  */
+  InstrHashTreeVariant build_variant(InstrIdx idx) {
+    const Instruction& instr = ctxt().get_instr_by_idx(idx);
+    auto dep_ids = ctxt().get_instr_dependencies_by_idx(idx);
 
-    if (tree.variants.find(deref_instr_hash) == tree.variants.end()) {
-      // Such variant has not been registered before, create a new one.
-      std::vector<InstrHashTree> variant;
+    std::vector<InstrHashTree> operand_trees;
+    for (size_t i = 0; i < dep_ids.size(); ++i) {
+      InstrIdx dep_idx = ctxt().get_instr_idx_by_id(dep_ids.at(i));
+      operand_trees.emplace_back(build_tree(dep_idx));
+    }
 
-      for (spv::Id dep_id : ctxt().get_instr_dependencies_by_idx(idx)) {
-        InstrHashTree subtree;
-        build_instr_hash_tree_impl(subtree, ctxt().get_instr_idx_by_id(dep_id));
-        variant.emplace_back(std::move(subtree));
-      }
-      tree.variants[deref_instr_hash] = std::move(variant);
-    } else {
-      // The variant already exists, step in to register our `idx` in `instrs`.
-      auto dep_ids = ctxt().get_instr_dependencies_by_idx(idx);
-      auto variant = tree.variants[deref_instr_hash];
-      for (size_t i = 0; i < dep_ids.size(); ++i) {
-        build_instr_hash_tree_impl(variant[i], dep_ids[i]);
-      }
+    InstrHashTreeVariant variant {};
+    variant.is_itervar_constexpr = false; // FIXME: (penguinliong)
+    variant.operand_trees = std::move(operand_trees);
+    // `variant.instrs` is marked later.
+    return variant;
+  }
+  InstrHashTree build_tree(InstrIdx idx) {
+    const Instruction& instr = ctxt().get_instr_by_idx(idx);
+    auto instr_hash = ctxt().get_instr_hash_by_idx(idx);
+
+    InstrHashTree out {};
+    // `out.variants` will be marked later.
+    out.op = instr.opcode;
+    return out;
+  }
+  void mark_tree(InstrHashTree& tree, InstrIdx idx) {
+    const Instruction& instr = ctxt().get_instr_by_idx(idx);
+    auto instr_hash = ctxt().get_instr_hash_by_idx(idx);
+
+    // If the variant has not been registered before, register it first.
+    if (tree.variants.find(instr_hash) == tree.variants.end()) {
+      tree.variants[instr_hash] = build_variant(idx);
+    }
+
+    // Mark that the current variant of the tree node is used by this current
+    // instruction.
+    InstrHashTreeVariant& variant = tree.variants[instr_hash];
+    variant.instrs.emplace_back(idx);
+
+    // Further mark the variants of subtrees.
+    const auto& dep_ids = ctxt().get_instr_dependencies_by_idx(idx);
+    for (size_t i = 0; i < dep_ids.size(); ++i) {
+      spv::Id dep_id = dep_ids[i];
+      auto& operand_tree = variant.operand_trees[i];
+      mark_tree(operand_tree, ctxt().get_instr_idx_by_id(dep_id));
     }
   }
   virtual void visit() override final {
-    build_instr_hash_tree_impl(ctxt().instr_hash_tree_root, idx());
+    mark_tree(ctxt().instr_hash_tree_root, idx());
   }
 };
 
 // -----------------------------------------------------------------------------
+
+void dbg_print_instr_hash_tree(const InstrHashTree& tree, uint32_t depth, std::stringstream& ss) {
+  for (const auto& variant : tree.variants) {
+    variant.second;
+  }
+}
+std::string dbg_print_instr_hash_tree(const InstrHashTree& tree) {
+  return {};
+}
+
+// A ramped statement is a sequence of statements to apply a same operation
+// to multiple data, in which the only different between the statements is their
+// indices which are itervar-constant-expressions.
+struct RampedStmt {
+  std::vector<InstrIdx> instrs;
+};
 
 SpirvBinary process(const SpirvBinary& spv) {
   Context ctxt {};
