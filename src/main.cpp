@@ -12,6 +12,7 @@
 #include "liella/collect-id-refs.hpp"
 #include "liella/hash-instr.hpp"
 #include "liella/op2name.hpp"
+#include "liella/parse-instr.hpp"
 
 std::vector<uint32_t> load_spv(const std::string& path) {
   std::ifstream is(path, std::ios::in | std::ios::ate | std::ios::binary);
@@ -33,8 +34,6 @@ void store_spv(const std::string& path, const std::vector<uint32_t> spv) {
 
 
 using namespace liella;
-
-typedef uint32_t InstrIdx;
 
 // To get an `InstrHash`, feed the hasher with literal operands and zero-feed
 // with zero if the operand is an ID reference, in specification order.
@@ -136,11 +135,15 @@ struct Context {
 
   // Provided by `IdDependencyExtractor`.
   std::vector<std::vector<spv::Id>> dependencies_by_instr_idx;
+  std::map<InstrIdx, uint32_t> ref_count_by_instr_idx;
   const std::vector<spv::Id>& get_instr_dependencies_by_idx(InstrIdx idx) {
     return dependencies_by_instr_idx[idx];
   }
   const std::vector<spv::Id>& get_instr_dependencies_by_id(spv::Id id) {
     return get_instr_dependencies_by_idx(get_instr_idx_by_id(id));
+  }
+  uint32_t get_ref_count_by_idx(InstrIdx idx) {
+    return ref_count_by_instr_idx[idx];
   }
 
   // Provided by `LoopExtractor`.
@@ -383,9 +386,27 @@ struct CodeBlockExtractor : public SpirvVisitor {
 struct IdDependencyExtractor : public SpirvVisitor {
   virtual void visit() override final {
     std::vector<uint32_t> id_refs = liella::collect_id_refs(instr());
+    for (auto id_ref : id_refs) {
+      ctxt().ref_count_by_instr_idx[id_ref] += 1;
+    }
     ctxt().dependencies_by_instr_idx.emplace_back(id_refs);
   }
 };
+
+// -----------------------------------------------------------------------------
+
+
+struct InstrExtractor : public SpirvVisitor {
+  std::map<spv::Id, InstrIdx> id2idx;
+  std::map<InstrIdx, std::shared_ptr<Instr>> idx2instr;
+  virtual void visit() override final {
+    liella::parse_instr(idx(), instr(), id2idx, idx2instr);
+  }
+};
+
+
+
+
 
 // -----------------------------------------------------------------------------
 
@@ -899,6 +920,12 @@ SpirvBinary process(const SpirvBinary& spv) {
   ImplicitLoopFinder implicit_loop_finder;
 
   SpirvPass(ctxt).with_visitor(implicit_loop_finder)
+    .apply(spv.instrs);
+
+  InstrExtractor instr_extractor;
+
+  SpirvPass(ctxt)
+    .with_visitor(instr_extractor)
     .apply(spv.instrs);
 
   if (implicit_loop_finder.implicit_loops.back().end == 0) {

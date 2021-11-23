@@ -7,8 +7,11 @@
 #include <memory>
 #define SPV_ENABLE_UTILITY_CODE
 #include "spirv/unified1/SPIRV.hpp"
+#include "liella/fnv.hpp"
 
 namespace liella {
+
+typedef uint32_t InstrIdx;
 
 struct OperandIterator {
   const uint32_t* pos;
@@ -24,6 +27,11 @@ struct OperandIterator {
       }
     } while (!ate());
     return out;
+  }
+  // Returns false if the string is ended by this 32b word.
+  inline bool str_u32(uint32_t& out) {
+    out = *(pos++);
+    return (out >> 24) != 0;
   }
 
   inline bool ate() const { return pos == end; }
@@ -99,4 +107,55 @@ std::vector<uint32_t> serialize_spv(const SpirvBinary& spv) {
   return out;
 }
 
-} // namespace tinyspv
+
+// Out internal structure.
+struct Instr;
+struct Operand {
+  uint32_t literal;
+  std::shared_ptr<Instr> ref;
+
+  inline bool is_literal() const { return ref == nullptr; }
+  inline bool is_ref() const { return ref != nullptr; }
+};
+inline Operand make_operand(uint32_t literal) {
+  return { literal, nullptr };
+}
+inline Operand make_operand(const std::shared_ptr<Instr>& ref) {
+  return { 0, ref };
+}
+
+struct Instr {
+  spv::Op op;
+  std::vector<Operand> operands;
+
+  inline uint64_t hash(bool deref = false) const {
+    Fnv hasher {};
+    hasher.feed(op);
+    for (const auto& operand : operands) {
+      if (operand.is_literal()) {
+        hasher.feed(operand.literal);
+      } else if (deref) {
+        hasher.feed(operand.ref->hash());
+      }
+    }
+    return hasher.hash;
+  }
+};
+
+struct InstrBuilder {
+  Instr inner;
+
+  InstrBuilder(spv::Op op) : inner { op, {} } {}
+
+  void push(uint32_t literal) {
+    inner.operands.emplace_back(make_operand(literal));
+  }
+  void push(const std::shared_ptr<Instr>& ref) {
+    inner.operands.emplace_back(make_operand(ref));
+  }
+  std::shared_ptr<Instr> build() {
+    return std::make_shared<Instr>(std::move(inner));
+  }
+};
+
+} // namespace liella

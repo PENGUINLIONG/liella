@@ -1,0 +1,7 @@
+#version 450
+void main() {
+	int buf[16];
+	for(int i = 0; i < 16; ++i) {
+		buf[i] = i;
+	}
+}
